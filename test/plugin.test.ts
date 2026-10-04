@@ -17,7 +17,9 @@ mock.module("@anthropic-ai/sandbox-runtime", () => ({
 }))
 
 import * as pluginModule from "../src/index"
-import { SandboxPlugin, server } from "../src/index"
+import plugin, { SandboxPlugin, server } from "../src/index"
+import { prepareCommand } from "../src/shell"
+import legacyPlugin from "../src/v1"
 
 const sanitizedPersistenceWarning = "Failed to restore original command in tool history"
 
@@ -32,6 +34,174 @@ const makeCtx = (
   worktree: worktree,
   serverUrl: new URL("http://localhost:4096"),
   $: (() => {}) as any,
+})
+
+describe("OpenCode V2", () => {
+  beforeEach(() => {
+    mockInitialize.mockClear()
+    mockWrapWithSandbox.mockClear()
+    delete process.env.OPENCODE_DISABLE_SANDBOX
+    delete process.env.OPENCODE_SANDBOX_CONFIG
+  })
+
+  const context = () => {
+    const callbacks = new Map<string, (event: any) => void | Promise<void>>()
+    const hook = mock(async (name: string, callback: (event: any) => void | Promise<void>) => {
+      callbacks.set(name, callback)
+      return { dispose: async () => {} }
+    })
+    return {
+      ctx: {
+        location: {
+          directory: "/tmp/worktree/subdir",
+          project: { directory: "/tmp/worktree", canonical: "/tmp/canonical" },
+        },
+        shell: { hook },
+        tool: { hook },
+      } as any,
+      hook,
+      callbacks,
+    }
+  }
+
+  const launch = {
+    config: { filesystem: {}, network: {} },
+    shell: "/bin/bash",
+    mode: "enforce" as const,
+  }
+
+  test("exports both supported entrypoints with a stable plugin ID", () => {
+    expect(plugin.id).toBe("opencode-sandbox")
+    expect(plugin.server).toBe(SandboxPlugin)
+    expect(legacyPlugin).toBe(SandboxPlugin)
+  })
+
+  test("selects the launcher while preserving permission and history inputs", async () => {
+    if (process.platform === "win32") return
+    const { ctx, hook, callbacks } = context()
+    await plugin.setup(ctx)
+    expect(hook).toHaveBeenCalledTimes(1)
+    expect(mockInitialize).not.toHaveBeenCalled()
+    const event = {
+      command: "printf '%s\\n' '$(literal)' && git status",
+      shell: "/bin/zsh",
+      cwd: "/tmp/worktree/subdir",
+      timeout: 120_000,
+      env: { TEST_ENV: "keep" },
+    }
+    const original = structuredClone(event)
+    await callbacks.get("create.before")?.(event)
+    expect(event.command).toBe(original.command)
+    expect(event.cwd).toBe(original.cwd)
+    expect(event.timeout).toBe(original.timeout)
+    expect(event.env.TEST_ENV).toBe("keep")
+    expect(event.shell).toEndWith("/src/shell.ts")
+    const settings = JSON.parse((event.env as any).OPENCODE_SANDBOX_LAUNCH)
+    expect(settings.shell).toBe("/bin/zsh")
+    expect(settings.mode).toBe("permissive")
+    expect(settings.config.filesystem.allowWrite).toContain("/tmp/worktree/subdir")
+    expect(settings.config.filesystem.allowWrite).toContain("/tmp/worktree")
+    expect(settings.config.filesystem.allowWrite).not.toContain("/tmp/canonical")
+  })
+
+  test("keeps trusted external configuration and enforcement mode", async () => {
+    if (process.platform === "win32") return
+    process.env.OPENCODE_SANDBOX_CONFIG = JSON.stringify({
+      mode: "enforce",
+      network: { allowedDomains: ["example.com"] },
+    })
+    const { ctx, callbacks } = context()
+    // Project-local plugin options do not override the trusted sandbox settings.
+    ctx.options = { disabled: true, filesystem: { allowWrite: ["/"] } }
+    await plugin.setup(ctx)
+    const event = { shell: "/bin/bash", env: {} } as any
+    await callbacks.get("create.before")?.(event)
+    const settings = JSON.parse(event.env.OPENCODE_SANDBOX_LAUNCH)
+    expect(settings.mode).toBe("enforce")
+    expect(settings.config.network.allowedDomains).toEqual(["example.com"])
+    expect(settings.config.filesystem.allowWrite).not.toContain("/")
+  })
+
+  test("registers nothing when disabled by environment or trusted config", async () => {
+    for (const value of ["1", "true"]) {
+      process.env.OPENCODE_DISABLE_SANDBOX = value
+      const { ctx, hook } = context()
+      await plugin.setup(ctx)
+      expect(hook).not.toHaveBeenCalled()
+    }
+    delete process.env.OPENCODE_DISABLE_SANDBOX
+    process.env.OPENCODE_SANDBOX_CONFIG = '{"disabled":true}'
+    const { ctx, hook } = context()
+    await plugin.setup(ctx)
+    expect(hook).not.toHaveBeenCalled()
+  })
+
+  test("Windows passes through in permissive mode and blocks only shell tools in enforce mode", async () => {
+    const originalPlatform = Object.getOwnPropertyDescriptor(process, "platform")
+    if (!originalPlatform) throw new Error("Missing process.platform descriptor")
+    Object.defineProperty(process, "platform", { value: "win32" })
+    try {
+      process.env.OPENCODE_SANDBOX_CONFIG = '{"mode":"permissive"}'
+      const permissive = context()
+      await plugin.setup(permissive.ctx)
+      expect(permissive.hook).not.toHaveBeenCalled()
+      process.env.OPENCODE_SANDBOX_CONFIG = '{"mode":"enforce"}'
+      const enforced = context()
+      await plugin.setup(enforced.ctx)
+      expect(enforced.callbacks.has("create.before")).toBe(false)
+      const before = enforced.callbacks.get("execute.before")
+      expect(() => before?.({ tool: "shell" })).toThrow(
+        "Sandbox unavailable in enforce mode; command blocked",
+      )
+      expect(() => before?.({ tool: "read" })).not.toThrow()
+      expect(mockInitialize).not.toHaveBeenCalled()
+    } finally {
+      Object.defineProperty(process, "platform", originalPlatform)
+    }
+  })
+
+  test("initializes and wraps with the original shell and unique command attribution", async () => {
+    if (process.platform === "win32") return
+    expect(await prepareCommand("echo hello", launch)).toBe("srt-wrapped: echo hello")
+    await prepareCommand("echo hello", launch)
+    expect(mockInitialize).toHaveBeenCalledWith(launch.config)
+    const first = mockWrapWithSandbox.mock.calls[0] as any
+    const second = mockWrapWithSandbox.mock.calls[1] as any
+    expect(first[1]).toBe("/bin/bash")
+    expect(first[4].commandText).toBe("echo hello")
+    expect(first[4].commandId).not.toBe(second[4].commandId)
+  })
+
+  test("blocks initialization and wrapping failures in enforce mode", async () => {
+    if (process.platform === "win32") return
+    mockInitialize.mockImplementationOnce(() => Promise.reject(new Error("fixture-secret")))
+    await expect(prepareCommand("echo unsafe", launch)).rejects.toThrow(
+      "Sandbox unavailable in enforce mode; command blocked",
+    )
+    expect(mockWrapWithSandbox).not.toHaveBeenCalled()
+    mockWrapWithSandbox.mockImplementationOnce(() => Promise.reject(new Error("fixture-secret")))
+    await expect(prepareCommand("echo unsafe", launch)).rejects.toThrow(
+      "Sandbox unavailable in enforce mode; command blocked",
+    )
+  })
+
+  test("passes through initialization and wrapping failures in permissive mode", async () => {
+    if (process.platform === "win32") return
+    const permissive = { ...launch, mode: "permissive" as const }
+    mockInitialize.mockImplementationOnce(() => Promise.reject(new Error("fixture-secret")))
+    expect(await prepareCommand("echo hello", permissive)).toBe("echo hello")
+    mockWrapWithSandbox.mockImplementationOnce(() => Promise.reject(new Error("fixture-secret")))
+    expect(await prepareCommand("echo hello", permissive)).toBe("echo hello")
+  })
+
+  test("never executes an aborted command, including in permissive mode", async () => {
+    if (process.platform === "win32") return
+    const signal = AbortSignal.abort()
+    await expect(
+      prepareCommand("echo unsafe", { ...launch, mode: "permissive" }, signal),
+    ).rejects.toThrow()
+    expect(mockWrapWithSandbox).not.toHaveBeenCalled()
+  })
 })
 
 describe("SandboxPlugin", () => {

@@ -12,6 +12,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./v1": {
+      "types": "./dist/v1.d.ts",
+      "import": "./dist/v1.js"
     }
   },
   "files": [
@@ -20,7 +24,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "bun build ./src/index.ts --outdir dist --target node --format esm --external @anthropic-ai/sandbox-runtime --external @opencode-ai/plugin && bun x tsc --emitDeclarationOnly --declaration --outDir dist",
+    "build": "bun build ./src/index.ts ./src/v1.ts ./src/shell.ts --outdir dist --target node --format esm --external @anthropic-ai/sandbox-runtime --external @opencode/plugin && chmod +x dist/shell.js && bun x tsc --emitDeclarationOnly --declaration --outDir dist",
     "dev": "bun run --watch src/index.ts",
     "test": "bun test",
     "test:coverage": "bun test --coverage",
@@ -58,10 +62,16 @@
     "registry": "https://registry.npmjs.org/"
   },
   "dependencies": {
-    "@anthropic-ai/sandbox-runtime": "^0.0.76"
+    "@anthropic-ai/sandbox-runtime": "^0.0.76",
+    "@opencode/plugin": "^2.0.22"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@biomejs/biome": "^2.0.0",

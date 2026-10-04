@@ -6,24 +6,41 @@
 
 An [OpenCode](https://opencode.ai) plugin that sandboxes agent-executed commands using [`@anthropic-ai/sandbox-runtime`](https://github.com/anthropic-experimental/sandbox-runtime).
 
-Every `bash` tool invocation is wrapped with OS-level filesystem and network restrictions — no containers, no VMs, just native OS sandboxing primitives.
+Shell commands run with OS-level filesystem and network restrictions — no containers, no VMs, just native OS sandboxing primitives. Supports OpenCode V2's `shell` tool and OpenCode V1's `bash` tool.
 
 | Platform | Mechanism |
 |----------|-----------|
 | **macOS** | `sandbox-exec` (Seatbelt profiles) |
 | **Linux** | `bubblewrap` (namespace isolation) |
-| **Windows** | Not currently supported by OpenCode's command-string hook (commands pass through in `permissive` mode and are blocked in `enforce` mode) |
+| **Windows** | Not currently supported (commands pass through in `permissive` mode and are blocked in `enforce` mode) |
 
 ## Install
 
 ```json
 // opencode.json
 {
-  "plugin": ["opencode-sandbox"]
+  "plugins": ["opencode-sandbox"]
 }
 ```
 
 The plugin is automatically installed from npm when OpenCode starts.
+
+OpenCode V2 uses a default plugin definition with ID `opencode-sandbox`. The same package also exposes a V1 `server()` entrypoint, supported by OpenCode **1.18.29 and newer**. For V1, keep the singular config key:
+
+```json
+{
+  "plugin": ["opencode-sandbox"]
+}
+```
+
+Older V1 loaders can use the separate function entrypoint in a local plugin:
+
+```ts
+// .opencode/plugin/sandbox.ts (with opencode-sandbox installed)
+export { default } from "opencode-sandbox/v1"
+```
+
+The V2 launcher requires `node` on `PATH`. Local source plugins require Node 22.18+ for TypeScript execution; published packages contain compiled JavaScript. Existing sandbox config files and environment variables work with both versions. See the [OpenCode plugin migration guide](https://opencode.ai/v2/docs/build/plugins/migrate-v1).
 
 ### Linux prerequisites
 
@@ -65,7 +82,7 @@ Without this fix, bwrap will fail with `loopback: Failed RTM_NEWADDR: Operation 
 
 ## What it does
 
-When the agent runs a bash command, the sandbox enforces three layers of protection:
+When the agent runs a shell command, the sandbox enforces three layers of protection:
 
 ### Filesystem write protection
 
@@ -130,6 +147,8 @@ Everything else is **blocked by default**.
 ## Configuration
 
 Config files are stored outside the project directory (in `~/.config/opencode-sandbox/`) so that sandboxed commands cannot modify them. This prevents indirect prompt injection from weakening the sandbox by overwriting the config.
+
+V2's project-local plugin `options` do not override these trusted settings. Configure the sandbox through the external files or environment variables below.
 
 ### Config file locations
 
@@ -230,7 +249,7 @@ OPENCODE_SANDBOX_CONFIG='{"filesystem":{"denyRead":["~/.ssh","~/.gnupg","~/.aws/
 
 The default mode is `permissive`: if the sandbox cannot initialize or wrap a command, the command runs without sandboxing.
 
-Set `mode` to `enforce` to block `bash` commands whenever sandboxing cannot be applied, including on unsupported platforms:
+Set `mode` to `enforce` to block shell commands whenever sandboxing cannot be applied, including on unsupported platforms:
 
 ```json
 {
@@ -254,7 +273,19 @@ Or in any config file:
 
 ## How it works
 
-The plugin uses two OpenCode hooks:
+### OpenCode V2
+
+The plugin registers `ctx.shell.hook("create.before", ...)` and selects an executable sandbox launcher. It preserves the original command so OpenCode's permission scanner, tool history, job titles, and background notifications continue to use the user's input.
+
+Each launcher initializes its own sandbox runtime, wraps the command with `SandboxManager.wrapWithSandbox()`, executes it using the original shell, and resets the runtime after its child exits. This covers foreground and background commands, failures, timeouts, and graceful cancellation. Cancellation signals command descendants and escalates to SIGKILL after 500 ms if needed, before resetting the runtime. Remaining command descendants are also stopped after normal shell completion. The launcher stays in OpenCode's process group so OpenCode's own forced termination remains a backstop. If `ps` is unavailable, cleanup falls back to signalling the direct child. Cleanup failures produce a sanitized warning without replacing the command's exit status. Unloading the plugin removes its hook automatically; already-running launchers retain their restrictions until their commands exit.
+
+This starts a runtime and network proxy per command, adding startup overhead compared with V1's shared runtime. Sandbox failures are reported in command stderr; enforce mode exits with status 126 without executing the command. A forced SIGKILL skips cleanup handlers.
+
+An in-process shared runtime is not used: V2 runs `create.before` **before** permission scanning, with no separate post-permission spawn hook or per-command cleanup hook. Rewriting `command` there would change permission checks and recorded commands. In addition, the sandbox runtime's proxy applies one process-wide network policy; per-command filesystem overrides do not isolate different projects' network allowlists. Safe sharing would need a later spawn hook with lifecycle ownership and isolated runtime instances (or separate workers for different policies).
+
+### OpenCode V1
+
+The legacy implementation uses two OpenCode hooks:
 
 1. **`tool.execute.before`** — Intercepts bash commands and wraps them with `SandboxManager.wrapWithSandbox()` before execution
 2. **`tool.execute.after`** — Restores the original command on the tool arguments after execution
@@ -267,18 +298,18 @@ Agent → bash tool → [plugin wraps command] → sandboxed execution → [plug
 
 The AI model interprets sandbox errors (like "Read-only file system" or "Connection blocked") directly from command output — no additional annotation layer needed.
 
-Sandbox initialization is deferred until the first `bash` command, so the plugin does not interfere with OpenCode startup. Plugin diagnostics are sent through OpenCode's structured logger instead of being printed into the TUI. Sandbox violations are correlated with each individual tool call, including concurrent or repeated commands.
+Sandbox initialization is deferred until the first `bash` command, so the plugin does not interfere with OpenCode startup. V1 plugin diagnostics are sent through OpenCode's structured logger instead of being printed into the TUI. Sandbox violations are correlated with each individual tool call, including concurrent or repeated commands.
 
 ### Windows status
 
-`@anthropic-ai/sandbox-runtime` supports Windows through an argv-and-environment API, while OpenCode currently exposes this plugin's `bash` hook as a command string. Until those interfaces can be connected safely, the plugin leaves Windows commands unsandboxed in `permissive` mode and blocks `bash` commands in `enforce` mode.
+`@anthropic-ai/sandbox-runtime` supports Windows through an argv-and-environment API. This plugin uses its command-string API on macOS and Linux. It leaves Windows commands unsandboxed in `permissive` mode and blocks the `shell` (V2) or `bash` (V1) tool in `enforce` mode.
 
 ### Failure behavior
 
-In the default `permissive` mode, commands run normally if sandbox initialization or wrapping fails. In `enforce` mode, the affected `bash` command is blocked instead.
+In the default `permissive` mode, commands run normally if sandbox initialization or wrapping fails. In `enforce` mode, the affected shell command is blocked instead.
 
 ## Related
 
 - [@anthropic-ai/sandbox-runtime](https://github.com/anthropic-experimental/sandbox-runtime) — The underlying sandbox engine
-- [OpenCode Plugins Docs](https://opencode.ai/docs/plugins) — How to create and use plugins
+- [OpenCode V2 Plugins Docs](https://opencode.ai/v2/docs/build/plugins/) — How to create and use plugins
 - [Claude Code Sandboxing](https://docs.claude.com/en/docs/claude-code/sandboxing) — Anthropic's sandboxing documentation
